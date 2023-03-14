@@ -85,6 +85,7 @@ import Hasura.Server.Limits
 import Hasura.Server.Logging
 import Hasura.Server.Middleware (corsMiddleware)
 import Hasura.Server.OpenAPI (buildOpenAPI)
+import Hasura.Server.Prometheus (exportPrometheusMetrics)
 import Hasura.Server.Rest
 import Hasura.Server.SchemaCacheRef
   ( SchemaCacheRef,
@@ -1070,6 +1071,10 @@ httpApp setupHook appCtx@AppContext {..} appEnv@AppEnv {..} ekgStore = do
         sc <- liftIO $ getSchemaCache acCacheRef
         json <- buildOpenAPI sc
         return (emptyHttpLogGraphQLInfo, JSONResp $ HttpResponse (encJFromJValue json) [])
+
+  Spock.get "v1/metrics" $ do
+    sampled <- liftIO $ exportPrometheusMetrics $ appEnvPrometheusMetrics
+    Spock.lazyBytes $ BB.toLazyByteString sampled
 
   forM_ [Spock.GET, Spock.POST] $ \m -> Spock.hookAny m $ \_ -> do
     req <- Spock.request

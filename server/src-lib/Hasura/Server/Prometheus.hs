@@ -14,11 +14,15 @@ module Hasura.Server.Prometheus
     decWarpThreads,
     incWebsocketConnections,
     decWebsocketConnections,
+    exportPrometheusMetrics,
   )
 where
 
+import Data.ByteString.Builder qualified as B
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
+import Data.List (intersperse)
+import Data.Map.Strict qualified as M
 import Hasura.Prelude
 import System.Metrics.Prometheus.Counter (Counter)
 import System.Metrics.Prometheus.Counter qualified as Counter
@@ -148,3 +152,169 @@ modifyConnectionsGauge ::
   (Connections -> Connections) -> ConnectionsGauge -> IO ()
 modifyConnectionsGauge f (ConnectionsGauge ref) =
   atomicModifyIORef' ref $ \connections -> (f connections, ())
+
+--------------------------------------------------------------------------------
+-- Prometheus exporter
+
+type Labels = [(String, String)]
+
+class Exportable a where
+  sample :: String -> Labels -> a -> IO B.Builder
+  typeName :: String
+  helpString :: Maybe String
+  helpString = Nothing
+
+instance Exportable Counter where
+  sample name labels metric = do
+    value <- Counter.read metric
+    return $ toSampleLine name labels (B.stringUtf8 $ show value)
+  typeName = "counter"
+
+instance Exportable Gauge where
+  sample name labels metric = do
+    value <- Gauge.read metric
+    return $ toSampleLine name labels (B.stringUtf8 $ show value)
+  typeName = "gauge"
+
+instance Exportable Histogram where
+  sample name labels metric = do
+    Histogram.HistogramSample {..} <- Histogram.read metric
+    return $
+      mconcat
+        [ let cumulativeBuckets =
+                snd $ M.mapAccum cumulativeSum 0 (histBuckets)
+                where
+                  cumulativeSum !sum_ x = let z = sum_ + x in (z, z)
+           in flip foldMap (M.toList cumulativeBuckets) $
+                \(upperBound, count) ->
+                  toSampleLine
+                    (name <> "_bucket")
+                    (("le", show upperBound) : labels)
+                    (B.stringUtf8 $ show count),
+          toSampleLine
+            (name <> "_bucket")
+            (("le", "+Inf") : labels)
+            (B.stringUtf8 $ show histCount),
+          toSampleLine
+            (name <> "_sum")
+            labels
+            (B.stringUtf8 $ show histSum),
+          toSampleLine
+            (name <> "_count")
+            labels
+            (B.stringUtf8 $ show histCount)
+        ]
+  typeName = "histogram"
+
+newtype HttpConnectionsGauge = HttpConnectionsGauge ConnectionsGauge
+
+instance Exportable HttpConnectionsGauge where
+  sample name labels (HttpConnectionsGauge (ConnectionsGauge ref)) = do
+    Connections {..} <- readIORef ref
+    return $ toSampleLine name labels (B.stringUtf8 $ show connWarpThreads)
+  typeName = "gauge"
+
+newtype WsConnectionsGauge = WsConnectionsGauge ConnectionsGauge
+
+instance Exportable WsConnectionsGauge where
+  sample name labels (WsConnectionsGauge (ConnectionsGauge ref)) = do
+    Connections {..} <- readIORef ref
+    return $ toSampleLine name labels (B.stringUtf8 $ show connWebsockets)
+  typeName = "gauge"
+
+exportPrometheusMetrics :: PrometheusMetrics -> IO B.Builder
+exportPrometheusMetrics PrometheusMetrics {..} = do
+  l <- sequence metricLines
+  pure $ mconcat $ intersperse (B.charUtf8 '\n') l
+  where
+    GraphQLRequestMetrics {..} = pmGraphQLRequestMetrics
+    EventTriggerMetrics {..} = pmEventTriggerMetrics
+    metricLines =
+      [ -- TODO: hasura_http_connections, missing metric
+        exportMetric
+          "hasura_websocket_connections"
+          (WsConnectionsGauge pmConnections)
+          [],
+        exportMetric
+          "hasura_active_subscriptions"
+          pmActiveSubscriptions
+          [],
+        exportMetric
+          "hasura_graphql_requests_total"
+          gqlRequestsQuerySuccess
+          [("operation_type", "query"), ("response_status", "success")],
+        exportMetric
+          "hasura_graphql_requests_total"
+          gqlRequestsQueryFailure
+          [("operation_type", "query"), ("response_status", "failed")],
+        exportMetric
+          "hasura_graphql_requests_total"
+          gqlRequestsMutationSuccess
+          [("operation_type", "mutation"), ("response_status", "success")],
+        exportMetric
+          "hasura_graphql_requests_total"
+          gqlRequestsMutationFailure
+          [("operation_type", "mutation"), ("response_status", "failed")],
+        exportMetric
+          "hasura_graphql_requests_total"
+          gqlRequestsUnknownFailure
+          [("operation_type", "unknown"), ("response_status", "failed")],
+        exportMetric
+          "hasura_graphql_execution_time_seconds"
+          gqlExecutionTimeSecondsQuery
+          [("operation_type", "query")],
+        exportMetric
+          "hasura_graphql_execution_time_seconds"
+          gqlExecutionTimeSecondsMutation
+          [("operation_type", "mutation")],
+        exportMetric
+          "hasura_event_queue_time_seconds"
+          eventQueueTimeSeconds
+          [],
+        exportMetric
+          "hasura_event_fetch_time_per_batch_seconds"
+          eventsFetchTimePerBatch
+          [],
+        exportMetric
+          "hasura_event_webhook_processing_time_seconds"
+          eventWebhookProcessingTime
+          [],
+        exportMetric
+          "hasura_event_processing_time_seconds"
+          eventProcessingTime
+          [],
+        exportMetric
+          "hasura_event_trigger_http_workers"
+          eventTriggerHTTPWorkers
+          []
+          -- NOTE: hasura_postgres_connections doesn't make much sence, since
+          -- Hasura creates a pool with only one connection, see
+          -- server/src-lib/Hasura/Backends/Postgres/Connection/Connect.hs
+      ]
+
+exportMetric ::
+  forall a.
+  (Exportable a) =>
+  String ->
+  a ->
+  Labels ->
+  IO B.Builder
+exportMetric name metric labels = do
+  sampled <- sample name labels metric
+  let helpLine = case helpString @a of
+        Nothing -> mempty
+        Just s -> B.stringUtf8 $ "# HELP " <> s <> "\n"
+  let typeLine = B.stringUtf8 $ "# TYPE " <> name <> " " <> typeName @a <> "\n"
+  return $ helpLine <> typeLine <> sampled
+
+toSampleLine :: String -> Labels -> B.Builder -> B.Builder
+toSampleLine name labels value =
+  B.stringUtf8 name
+    <> B.charUtf8 '{'
+    <> B.stringUtf8 labelsRaw
+    <> B.charUtf8 '}'
+    <> B.charUtf8 ' '
+    <> value
+    <> B.charUtf8 '\n'
+  where
+    labelsRaw = intercalate "," $ map (\(n, v) -> n ++ "=\"" ++ v ++ "\"") labels
